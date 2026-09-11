@@ -4,7 +4,6 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>逻辑铸基 · 逻辑就业顾问</title>
-<script src="https://cdn.jsdelivr.net/npm/@tencent-ai/workbuddy-cloud-sdk@dev/lib/index.global.js"></script>
 <style>
   :root{
     --brand:#5b63b3; --brand-soft:#eef0f9; --bg:#f4f5fa; --card:#ffffff;
@@ -89,51 +88,105 @@
 </div>
 
 <script>
-/* ================= 云服务配置（WorkBuddy Cloud Service publicConfig） ================= */
-const PUBLIC_CONFIG = {
-  endpoint: "https://logic-career-advisor.app.workbuddy.host",
-  publishableKey: "wbpk_8SyYHF5OY6iH9wXw18jR7o_2K01JLkYZeoNhvEQwM5Vxr5muYv2JY79"
-};
-let cloud = null, MODEL_ID = null, LLM_OK = false;
+/* ============================================================
+   API 配置区（Cloudflare Worker 代理模式 · 密钥隐藏）
+   密钥不存在于本文件：存放在 Cloudflare 的环境变量 API_KEY 中
+   （Pages 项目：设置→环境变量→添加加密变量 API_KEY；
+     独立 Worker：Settings→Variables→Secret）。
 
+   proxyURL 两种填法：
+   1. "/api"        —— Cloudflare Pages + Pages Functions（仓库内
+                       functions/api/[[path]].js 自动部署，同源转发）
+   2. 完整 Worker 地址 —— 如 https://logic-proxy.<你的子域>.workers.dev/api
+                       （适合 GitHub Pages 等其他静态托管）
+
+   若想不经过代理直连（密钥写在页面里），填 baseURL + apiKey 即可。
+   模型可换：deepseek-v4-pro / ZHIPU/GLM-5.3 / kimi-k3 等
+   ============================================================ */
+const API_CONFIG = {
+  baseURL: "",   /* 直连模式才填（以 /v1 结尾） */
+  apiKey:  "",   /* 直连模式才填；Worker 模式留空 */
+  proxyURL: "/api",   /* Worker 代理地址（见上方说明） */
+  model:   "qwen3.8-max"
+};
+let MODEL_ID = null, LLM_OK = false;
+
+/* 启动时检查配置：直连 / Worker 代理 / 本地代理 */
 async function initLLM(){
   const st = document.getElementById("aiState");
-  try{
-    cloud = WorkBuddyCloud.createWorkBuddyCloud({
-      endpoint: PUBLIC_CONFIG.endpoint,
-      publishableKey: PUBLIC_CONFIG.publishableKey
-    });
-    const models = await cloud.llm.models.list();
-    /* 固定使用账号下的 Hy3（混元思考模型，x0.00 积分倍率）；不可用时依次回退 hy3-x → 第一个可用模型 */
-    const prefer=["hy3","hy3-x"];
-    let m=null;
-    for(const pid of prefer){m=(models||[]).find(x=>x.id===pid&&x.disabled!==true&&x.enabled!==false);if(m)break;}
-    if(!m)m=(models||[]).find(x=>x.disabled!==true);
-    if(m){ MODEL_ID = m.id; LLM_OK = true; st.textContent = "AI 已连接："+(m.name||m.id)+"（"+m.id+"）"; st.className="on"; }
-    else { st.textContent = "AI 模型不可用 · 本地模式"; }
-  }catch(e){
-    st.textContent = "AI 未连接 · 本地模式";
+  const c = API_CONFIG;
+  if(!c.model){ st.textContent = "未配置模型 · 本地模式"; return; }
+  const direct = !!(c.baseURL && c.apiKey);
+  const proxy = !direct && !!c.proxyURL;
+  if(!direct && !proxy){ st.textContent = "未配置 API · 本地模式"; return; }
+  if(proxy && !/^https?:/i.test(c.proxyURL) && !location.protocol.startsWith("http")){
+    st.textContent = "请先运行 启动服务.bat · 本地模式";
+    st.title = "代理模式需通过服务访问：双击 启动服务.bat 后打开 http://localhost:8787";
+    return;
   }
+  MODEL_ID = c.model; LLM_OK = true;
+  st.textContent = "AI 已连接：" + c.model + (direct ? "（外部API）" : "（Worker代理 · 密钥已隐藏）");
+  st.className = "on";
 }
 
-/* 统一的大模型调用：system 首条消息 + 流式收集全文 */
+/* 统一的大模型调用：OpenAI 兼容 /chat/completions 流式接口 + SSE 解析 */
 async function llmCall(system, user, jsonMode, onDelta){
   if(!LLM_OK) throw new Error("llm_offline");
   let out = "";
-  const opts = {
-    model: MODEL_ID,
+  const body = {
+    model: API_CONFIG.model,
     messages: [ {role:"system", content:system}, {role:"user", content:user} ],
     stream: true,
     temperature: 0.4
   };
-  if(jsonMode) opts.response_format = {type:"json_object"};
+  if(jsonMode) body.response_format = {type:"json_object"};
   const ctl = new AbortController();
   const timer = setTimeout(()=>ctl.abort(), 90000);
-  opts.signal = ctl.signal;
+  const direct = !!(API_CONFIG.baseURL && API_CONFIG.apiKey);
+  const url = (direct
+    ? API_CONFIG.baseURL.replace(/\/+$/,"")
+    : API_CONFIG.proxyURL.replace(/\/+$/,"")) + "/chat/completions";
+  const headers = { "Content-Type":"application/json" };
+  if(API_CONFIG.apiKey) headers["Authorization"] = "Bearer " + API_CONFIG.apiKey;
+  let resp;
   try{
-    for await (const chunk of cloud.llm.chat.completions.create(opts)){
-      const d = chunk.choices && chunk.choices[0] && chunk.choices[0].delta;
-      if(d && d.content){ out += d.content; if(onDelta) onDelta(d.content); }
+    resp = await fetch(url, {
+      method: "POST",
+      headers: headers,
+      body: JSON.stringify(body),
+      signal: ctl.signal
+    });
+  }catch(e){
+    clearTimeout(timer);
+    throw new Error(e.name==="AbortError" ? "请求超时（90秒）" : "无法连接 API（请检查网络、地址是否正确，以及服务商是否支持浏览器跨域 CORS）");
+  }
+  if(!resp.ok){
+    clearTimeout(timer);
+    let msg = ""; try{ msg = (await resp.text()).slice(0,200); }catch(e){}
+    throw new Error("API 返回错误 " + resp.status + (msg ? "：" + msg : ""));
+  }
+  /* 解析 SSE 流 */
+  const reader = resp.body.getReader();
+  const dec = new TextDecoder();
+  let buf = "";
+  try{
+    while(true){
+      const r = await reader.read();
+      if(r.done) break;
+      buf += dec.decode(r.value, {stream:true});
+      const lines = buf.split("\n");
+      buf = lines.pop();
+      for(const line of lines){
+        const s = line.trim();
+        if(!s.startsWith("data:")) continue;
+        const data = s.slice(5).trim();
+        if(data === "[DONE]") continue;
+        try{
+          const j = JSON.parse(data);
+          const d = j.choices && j.choices[0] && j.choices[0].delta;
+          if(d && d.content){ out += d.content; if(onDelta) onDelta(d.content); }
+        }catch(e){ /* 跳过不完整帧 */ }
+      }
     }
   } finally { clearTimeout(timer); }
   if(!out.trim()) throw new Error("empty");
