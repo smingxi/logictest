@@ -104,8 +104,12 @@ async function initLLM(){
       publishableKey: PUBLIC_CONFIG.publishableKey
     });
     const models = await cloud.llm.models.list();
-    const m = (models||[]).find(x => x.disabled !== true);
-    if(m){ MODEL_ID = m.id; LLM_OK = true; st.textContent = "AI 已连接："+(m.name||m.id); st.className="on"; }
+    /* 固定使用账号下的 Hy3（混元思考模型，x0.00 积分倍率）；不可用时依次回退 hy3-x → 第一个可用模型 */
+    const prefer=["hy3","hy3-x"];
+    let m=null;
+    for(const pid of prefer){m=(models||[]).find(x=>x.id===pid&&x.disabled!==true&&x.enabled!==false);if(m)break;}
+    if(!m)m=(models||[]).find(x=>x.disabled!==true);
+    if(m){ MODEL_ID = m.id; LLM_OK = true; st.textContent = "AI 已连接："+(m.name||m.id)+"（"+m.id+"）"; st.className="on"; }
     else { st.textContent = "AI 模型不可用 · 本地模式"; }
   }catch(e){
     st.textContent = "AI 未连接 · 本地模式";
